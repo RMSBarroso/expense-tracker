@@ -25,7 +25,15 @@
   var EXPENSE_CATEGORIES = ["deslocacoes","refeicoes","alojamento","material"];
   var EXPENSE_CATEGORY_LABEL = { deslocacoes:"Deslocações", refeicoes:"Refeições", alojamento:"Alojamento", material:"Material" };
 
-  var currentView = "tasks"; // "tasks" | "meetings" | "projects" | "expenses"
+  var DEFAULT_BRANDS = ["Kennametal","Bass","Arno","GAIt"];
+
+  var currentView = "home"; // "home" | "tasks" | "meetings" | "projects" | "expenses"
+
+  // Sales/purchase values imported from a file: { "AAAA-MM": { "Marca": { venda:n, compra:n } } }.
+  // Kept on this device only (not synced), under a per-user key.
+  var salesData = {};
+  var homeMonth = null;
+  var homeBrand = null;
 
   var clients = {};
   var tasks = {};
@@ -232,7 +240,238 @@
     return expenses;
   }
 
+  // ---------- home: sales & purchases ----------
+  function salesKey(){ return STORAGE_KEY + ":vendasCompras"; }
+  function loadSalesData(){
+    salesData = {};
+    homeBrand = null;
+    try {
+      var raw = localStorage.getItem(salesKey());
+      if (raw){
+        var parsed = JSON.parse(raw);
+        if (parsed && typeof parsed === "object"){
+          salesData = parsed.data || {};
+          homeBrand = parsed.brand || null;
+        }
+      }
+    } catch(e){ salesData = {}; }
+  }
+  function saveSalesData(){
+    try { localStorage.setItem(salesKey(), JSON.stringify({ data:salesData, brand:homeBrand })); } catch(e){}
+  }
+
+  function brandList(){
+    var seen = {};
+    var list = [];
+    function add(b){
+      var k = b.toLowerCase();
+      if (!seen[k]){ seen[k] = true; list.push(b); }
+    }
+    DEFAULT_BRANDS.forEach(add);
+    Object.keys(salesData).sort().forEach(function(ym){
+      Object.keys(salesData[ym] || {}).forEach(add);
+    });
+    return list;
+  }
+  function findBrandKey(monthData, brand){
+    if (!monthData || !brand) return null;
+    var target = brand.toLowerCase();
+    for (var b in monthData) if (b.toLowerCase() === target) return b;
+    return null;
+  }
+
+  function normalizeHeader(h){
+    return String(h || "").trim().toLowerCase()
+      .normalize("NFD").replace(/[̀-ͯ]/g, "")
+      .replace(/[^a-z]/g, "");
+  }
+  function splitCsvLine(line, sep){
+    var out = [], cur = "", inQ = false;
+    for (var i = 0; i < line.length; i++){
+      var c = line[i];
+      if (inQ){
+        if (c === '"'){
+          if (line[i+1] === '"'){ cur += '"'; i++; }
+          else inQ = false;
+        } else cur += c;
+      } else if (c === '"') inQ = true;
+      else if (c === sep){ out.push(cur); cur = ""; }
+      else cur += c;
+    }
+    out.push(cur);
+    return out.map(function(s){ return s.trim(); });
+  }
+  // Accepts "1.234,56", "1234,56", "1234.56", "1,234.56" and "€ 1 234,56".
+  function parseFileAmount(str){
+    var s = String(str || "").replace(/[€\s ]/g, "");
+    if (!s) return null;
+    var lastComma = s.lastIndexOf(","), lastDot = s.lastIndexOf(".");
+    if (lastComma > -1 && lastDot > -1){
+      if (lastComma > lastDot) s = s.replace(/\./g, "").replace(",", ".");
+      else s = s.replace(/,/g, "");
+    } else if (lastComma > -1){
+      s = s.replace(/\./g, "").replace(",", ".");
+    } else if (lastDot > -1 && /^-?\d{1,3}(\.\d{3})+$/.test(s)){
+      s = s.replace(/\./g, "");
+    }
+    var n = parseFloat(s);
+    return isNaN(n) ? null : n;
+  }
+  // "2026-11", "2026/11", "11/2026", "11-2026", "2026-11-05", "05/11/2026" → "2026-11".
+  function parseFileMonth(str){
+    var s = String(str || "").trim();
+    var m;
+    if ((m = s.match(/^(\d{4})[-\/.](\d{1,2})(?:[-\/.]\d{1,2})?$/))) return m[1] + "-" + m[2].padStart(2,"0");
+    if ((m = s.match(/^(\d{1,2})[-\/.](\d{4})$/))) return m[2] + "-" + m[1].padStart(2,"0");
+    if ((m = s.match(/^\d{1,2}[-\/.](\d{1,2})[-\/.](\d{4})$/))) return m[2] + "-" + m[1].padStart(2,"0");
+    return null;
+  }
+
+  function parseSalesCsv(text){
+    var lines = String(text).replace(/^﻿/, "").split(/\r\n|\n|\r/).filter(function(l){ return l.trim() !== ""; });
+    if (lines.length < 2) throw new Error("O ficheiro não tem linhas de dados.");
+    var first = lines[0];
+    var sep = [";", "\t", ","].reduce(function(best, s){
+      return first.split(s).length > first.split(best).length ? s : best;
+    }, ";");
+    var headers = splitCsvLine(first, sep).map(normalizeHeader);
+    function col(names){
+      for (var i = 0; i < headers.length; i++) if (names.indexOf(headers[i]) > -1) return i;
+      return -1;
+    }
+    var iMonth = col(["mes","month","periodo","data","date"]);
+    var iBrand = col(["marca","brand","fornecedor"]);
+    var iSale = col(["venda","vendas","valorvenda","valordevenda","sale","sales"]);
+    var iBuy = col(["compra","compras","valorcompra","valordecompra","purchase","purchases"]);
+    if (iBrand < 0) throw new Error("Falta a coluna \"Marca\".");
+    if (iSale < 0 && iBuy < 0) throw new Error("Faltam as colunas \"Venda\" e/ou \"Compra\".");
+
+    var fallbackMonth = todayStr().slice(0,7);
+    var result = {}, rows = 0, skipped = 0;
+    for (var r = 1; r < lines.length; r++){
+      var cells = splitCsvLine(lines[r], sep);
+      var brand = (cells[iBrand] || "").trim();
+      var ym = iMonth > -1 ? parseFileMonth(cells[iMonth]) : fallbackMonth;
+      var sale = iSale > -1 ? parseFileAmount(cells[iSale]) : null;
+      var buy = iBuy > -1 ? parseFileAmount(cells[iBuy]) : null;
+      if (!brand || !ym || (sale === null && buy === null)){ skipped++; continue; }
+      result[ym] = result[ym] || {};
+      var key = findBrandKey(result[ym], brand) || brand;
+      var entry = result[ym][key] = result[ym][key] || { venda:null, compra:null };
+      // Several rows for the same brand and month are added together.
+      if (sale !== null) entry.venda = (entry.venda || 0) + sale;
+      if (buy !== null) entry.compra = (entry.compra || 0) + buy;
+      rows++;
+    }
+    if (!rows) throw new Error("Nenhuma linha válida encontrada.");
+    return { data:result, rows:rows, skipped:skipped };
+  }
+
+  function setHomeImportStatus(message, isError){
+    var s = document.getElementById("homeImportStatus");
+    s.textContent = message || "";
+    s.classList.toggle("error", !!isError);
+  }
+
+  function importSalesFile(file){
+    var reader = new FileReader();
+    reader.onload = function(){
+      var parsed;
+      try { parsed = parseSalesCsv(reader.result); }
+      catch(e){ setHomeImportStatus("Não foi possível importar: " + e.message, true); return; }
+      var months = Object.keys(parsed.data).sort();
+      months.forEach(function(ym){
+        salesData[ym] = salesData[ym] || {};
+        Object.keys(parsed.data[ym]).forEach(function(brand){
+          var existing = findBrandKey(salesData[ym], brand);
+          if (existing && existing !== brand) delete salesData[ym][existing];
+          salesData[ym][brand] = parsed.data[ym][brand];
+        });
+      });
+      homeMonth = months.indexOf(todayStr().slice(0,7)) > -1 ? todayStr().slice(0,7) : months[months.length - 1];
+      saveSalesData();
+      setHomeImportStatus(
+        "Importadas " + parsed.rows + " linha(s) de " + months.length + " mês(es)" +
+        (parsed.skipped ? " · " + parsed.skipped + " linha(s) ignorada(s)" : "") + ".",
+        false
+      );
+      renderHome();
+    };
+    reader.onerror = function(){ setHomeImportStatus("Não foi possível ler o ficheiro.", true); };
+    reader.readAsText(file, "utf-8");
+  }
+
+  function downloadSalesTemplate(){
+    var ym = todayStr().slice(0,7);
+    var lines = ["Mês;Marca;Venda;Compra"].concat(DEFAULT_BRANDS.map(function(b){ return ym + ";" + b + ";0,00;0,00"; }));
+    var blob = new Blob(["﻿" + lines.join("\r\n") + "\r\n"], { type:"text/csv;charset=utf-8" });
+    var url = URL.createObjectURL(blob);
+    var a = document.createElement("a");
+    a.href = url;
+    a.download = "modelo-vendas-compras.csv";
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    setTimeout(function(){ URL.revokeObjectURL(url); }, 1000);
+  }
+
+  function shiftHomeMonth(delta){
+    var parts = homeMonth.split("-");
+    var d = new Date(parseInt(parts[0], 10), parseInt(parts[1], 10) - 1 + delta, 1);
+    homeMonth = d.getFullYear() + "-" + String(d.getMonth()+1).padStart(2,"0");
+    renderHome();
+  }
+
+  function renderHome(){
+    if (!homeMonth) homeMonth = todayStr().slice(0,7);
+    var brands = brandList();
+    if (!homeBrand || brands.map(function(b){ return b.toLowerCase(); }).indexOf(homeBrand.toLowerCase()) < 0) homeBrand = brands[0];
+
+    var select = document.getElementById("homeBrandSelect");
+    select.innerHTML = "";
+    brands.forEach(function(b){
+      var opt = document.createElement("option");
+      opt.value = b;
+      opt.textContent = b;
+      if (b.toLowerCase() === homeBrand.toLowerCase()) opt.selected = true;
+      select.appendChild(opt);
+    });
+
+    document.getElementById("homeMonthLabel").textContent = monthLabel(homeMonth);
+    var monthData = salesData[homeMonth] || {};
+    var brandKeys = Object.keys(monthData);
+
+    var totalSale = 0, hasSale = false;
+    brandKeys.forEach(function(b){
+      if (monthData[b].venda != null){ totalSale += monthData[b].venda; hasSale = true; }
+    });
+    document.getElementById("homeSaleValue").textContent = hasSale ? formatCurrency(totalSale) : "—";
+    document.getElementById("homeSaleHint").textContent = hasSale
+      ? "Total de " + brandKeys.length + " marca(s) em " + monthLabel(homeMonth)
+      : "Sem valores importados para este mês";
+
+    var entry = monthData[findBrandKey(monthData, homeBrand)];
+    var hasBuy = entry && entry.compra != null;
+    document.getElementById("homePurchaseLabel").textContent = "Valor de compra · " + homeBrand;
+    document.getElementById("homePurchaseValue").textContent = hasBuy ? formatCurrency(entry.compra) : "—";
+    document.getElementById("homePurchaseHint").textContent = hasBuy
+      ? (entry.venda != null ? "Venda desta marca: " + formatCurrency(entry.venda) : "Sem valor de venda desta marca")
+      : "Sem valor de compra de " + homeBrand + " neste mês";
+  }
+
   function render(){
+    var isHome = currentView === "home";
+    document.getElementById("filters").hidden = isHome;
+    document.getElementById("homeView").hidden = !isHome;
+    document.getElementById("newItemBtn").hidden = isHome;
+    if (isHome){
+      document.getElementById("board").hidden = true;
+      document.getElementById("meetingsView").hidden = true;
+      document.getElementById("projectsView").hidden = true;
+      document.getElementById("expensesView").hidden = true;
+      renderHome();
+      return;
+    }
     renderFilters();
     document.getElementById("board").hidden = currentView !== "tasks";
     document.getElementById("meetingsView").hidden = currentView !== "meetings";
@@ -1167,6 +1406,19 @@
       else if (currentView === "projects") openProjectModal(null);
       else openExpenseModal(null);
     });
+    document.getElementById("homePrevMonthBtn").addEventListener("click", function(){ shiftHomeMonth(-1); });
+    document.getElementById("homeNextMonthBtn").addEventListener("click", function(){ shiftHomeMonth(1); });
+    document.getElementById("homeBrandSelect").addEventListener("change", function(){
+      homeBrand = this.value;
+      saveSalesData();
+      renderHome();
+    });
+    document.getElementById("homeImportBtn").addEventListener("click", function(){ document.getElementById("homeImportInput").click(); });
+    document.getElementById("homeImportInput").addEventListener("change", function(){
+      if (this.files && this.files[0]) importSalesFile(this.files[0]);
+      this.value = "";
+    });
+    document.getElementById("homeTemplateBtn").addEventListener("click", downloadSalesTemplate);
     document.getElementById("addMeetingBottomBtn").addEventListener("click", function(){ openMeetingModal(null); });
     document.getElementById("addProjectBottomBtn").addEventListener("click", function(){ openProjectModal(null); });
     document.getElementById("addExpenseBottomBtn").addEventListener("click", function(){ openExpenseModal(null); });
@@ -1316,6 +1568,8 @@
   function main(){
     try { loadStore(); }
     catch(e){ console.error("loadStore falhou", e); showFatalError("carregar dados", e); }
+    try { loadSalesData(); }
+    catch(e){ console.error("loadSalesData falhou", e); }
 
     try { wireStaticUI(); }
     catch(e){ console.error("wireStaticUI falhou", e); showFatalError("ligar botões", e); }

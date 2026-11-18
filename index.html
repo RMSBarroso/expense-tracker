@@ -86,7 +86,8 @@
   </header>
 
   <nav class="view-tabs" id="viewTabs" aria-label="Secções principais">
-    <button type="button" data-view="tasks" class="active" aria-current="page">Tarefas</button>
+    <button type="button" data-view="home" class="active" aria-current="page">Início</button>
+    <button type="button" data-view="tasks">Tarefas</button>
     <button type="button" data-view="meetings">Reuniões</button>
     <button type="button" data-view="projects">Projetos</button>
     <button type="button" data-view="expenses">Despesas</button>
@@ -104,7 +105,42 @@
 
   <div class="filters" id="filters"></div>
 
-  <main class="board" id="board"></main>
+  <section class="home-view" id="homeView" hidden>
+    <div class="home-toolbar">
+      <div class="month-nav">
+        <button type="button" class="icon-btn" id="homePrevMonthBtn" title="Mês anterior">‹</button>
+        <div class="month-nav-label mono" id="homeMonthLabel"></div>
+        <button type="button" class="icon-btn" id="homeNextMonthBtn" title="Mês seguinte">›</button>
+      </div>
+      <label class="home-brand-picker">
+        <span>Marca</span>
+        <select id="homeBrandSelect"></select>
+      </label>
+    </div>
+
+    <div class="home-cards">
+      <article class="home-card home-card-sale">
+        <span class="home-card-label">Valor de venda atual</span>
+        <strong class="home-card-value mono" id="homeSaleValue">—</strong>
+        <span class="home-card-hint" id="homeSaleHint"></span>
+      </article>
+      <article class="home-card home-card-purchase">
+        <span class="home-card-label" id="homePurchaseLabel">Valor de compra</span>
+        <strong class="home-card-value mono" id="homePurchaseValue">—</strong>
+        <span class="home-card-hint" id="homePurchaseHint"></span>
+      </article>
+    </div>
+
+    <div class="home-import">
+      <button type="button" class="btn btn-primary btn-sm" id="homeImportBtn">Importar ficheiro de vendas e compras</button>
+      <button type="button" class="btn btn-ghost btn-sm" id="homeTemplateBtn">Descarregar modelo CSV</button>
+      <input type="file" id="homeImportInput" accept=".csv,.txt,text/csv" hidden />
+      <span class="home-import-status" id="homeImportStatus" role="status" aria-live="polite"></span>
+    </div>
+    <p class="hint home-format-hint">O ficheiro deve ser um CSV (no Excel: <em>Guardar como → CSV</em>) com as colunas <strong>Mês</strong> (AAAA-MM), <strong>Marca</strong>, <strong>Venda</strong> e <strong>Compra</strong>. Os valores importados ficam guardados neste dispositivo e substituem os das mesmas marcas e meses.</p>
+  </section>
+
+  <main class="board" id="board" hidden></main>
 
   <div class="meetings-view" id="meetingsView" hidden>
     <div class="meetings-list" id="meetingsList"></div>
