@@ -112,10 +112,6 @@
         <div class="month-nav-label mono" id="homeMonthLabel"></div>
         <button type="button" class="icon-btn" id="homeNextMonthBtn" title="Mês seguinte">›</button>
       </div>
-      <label class="home-brand-picker">
-        <span>Marca</span>
-        <select id="homeBrandSelect"></select>
-      </label>
     </div>
 
     <div class="home-cards">
@@ -125,19 +121,33 @@
         <span class="home-card-hint" id="homeSaleHint"></span>
       </article>
       <article class="home-card home-card-purchase">
-        <span class="home-card-label" id="homePurchaseLabel">Valor de compra</span>
+        <span class="home-card-label">Valor de compra total</span>
         <strong class="home-card-value mono" id="homePurchaseValue">—</strong>
         <span class="home-card-hint" id="homePurchaseHint"></span>
       </article>
     </div>
 
-    <div class="home-import">
-      <button type="button" class="btn btn-primary btn-sm" id="homeImportBtn">Importar ficheiro de vendas e compras</button>
-      <button type="button" class="btn btn-ghost btn-sm" id="homeTemplateBtn">Descarregar modelo CSV</button>
-      <input type="file" id="homeImportInput" accept=".csv,.txt,text/csv" hidden />
-      <span class="home-import-status" id="homeImportStatus" role="status" aria-live="polite"></span>
+    <section class="home-brands">
+      <h2 class="home-brands-title">Compras por marca</h2>
+      <ul class="home-brand-list" id="homeBrandList"></ul>
+    </section>
+
+    <div class="home-files">
+      <div class="home-import">
+        <span class="home-import-label">Vendas</span>
+        <button type="button" class="btn btn-primary btn-sm" id="homeSaleRefreshBtn" hidden>Atualizar</button>
+        <button type="button" class="btn btn-ghost btn-sm" id="homeSaleLinkBtn">Escolher Excel de vendas</button>
+        <span class="home-import-status" id="homeSaleStatus" role="status" aria-live="polite"></span>
+      </div>
+      <div class="home-import">
+        <span class="home-import-label">Compras</span>
+        <button type="button" class="btn btn-primary btn-sm" id="homePurchaseRefreshBtn" hidden>Atualizar</button>
+        <button type="button" class="btn btn-ghost btn-sm" id="homePurchaseLinkBtn">Escolher Excel de compras</button>
+        <span class="home-import-status" id="homePurchaseStatus" role="status" aria-live="polite"></span>
+      </div>
+      <input type="file" id="homeImportInput" accept=".xlsx,.csv,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet,text/csv" hidden />
     </div>
-    <p class="hint home-format-hint">O ficheiro deve ser um CSV (no Excel: <em>Guardar como → CSV</em>) com as colunas <strong>Mês</strong> (AAAA-MM), <strong>Marca</strong>, <strong>Venda</strong> e <strong>Compra</strong>. Os valores importados ficam guardados neste dispositivo e substituem os das mesmas marcas e meses.</p>
+    <p class="hint home-format-hint">Os ficheiros Excel ficam no teu computador e nunca são enviados para lado nenhum: a aplicação apenas lê as colunas <strong>Mes01</strong> a <strong>Mes12</strong>. No Excel de vendas usa a linha "Total" (ou soma as linhas); no de compras, uma linha por marca.</p>
   </section>
 
   <main class="board" id="board" hidden></main>
@@ -416,6 +426,7 @@
 <script src="vendor/supabase.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/tesseract.js@5.1.1/dist/tesseract.min.js" integrity="sha384-GJqSu7vueQ9qN0E9yLPb3Wtpd7OrgK8KmYzC8T1IysG1bcvxvIO4qtYR/D3A991F" crossorigin="anonymous"></script>
 <script src="receipt.js"></script>
+<script src="xlsx-reader.js"></script>
 <script src="app.js"></script>
 <script src="sync.js"></script>
 <script src="auth.js"></script>

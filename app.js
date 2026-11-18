@@ -32,8 +32,9 @@
   // Sales/purchase values imported from a file: { "AAAA-MM": { "Marca": { venda:n, compra:n } } }.
   // Kept on this device only (not synced), under a per-user key.
   var salesData = {};
+  var mySales = {}; // my own sales: { "AAAA-MM": n|null }
+  var salesSources = {}; // { compra:{ name, readAt, year }, venda:{…} } — last file read for each
   var homeMonth = null;
-  var homeBrand = null;
 
   var clients = {};
   var tasks = {};
@@ -103,10 +104,14 @@
     if (n < 1024*1024) return (n/1024).toFixed(0) + " KB";
     return (n/(1024*1024)).toFixed(1) + " MB";
   }
+  // "1234.5" → "1 234,50 €". Built by hand because pt-PT's toLocaleString leaves
+  // four-digit amounts ungrouped ("8300,10 €"), which looks inconsistent next to "12 450,75 €".
   function formatCurrency(n){
     var v = Number(n) || 0;
-    try { return v.toLocaleString("pt-PT", { style:"currency", currency:"EUR" }); }
-    catch(e){ return v.toFixed(2) + " €"; }
+    var parts = Math.abs(v).toFixed(2).split(".");
+    var intPart = parts[0].replace(/\B(?=(\d{3})+(?!\d))/g, " ");
+    var negative = v < 0 && parts.join("") !== "000";
+    return (negative ? "-" : "") + intPart + "," + parts[1] + " €";
   }
   function parseAmountInput(str){
     if (!str) return 0;
@@ -244,20 +249,22 @@
   function salesKey(){ return STORAGE_KEY + ":vendasCompras"; }
   function loadSalesData(){
     salesData = {};
-    homeBrand = null;
+    mySales = {};
+    salesSources = {};
     try {
       var raw = localStorage.getItem(salesKey());
       if (raw){
         var parsed = JSON.parse(raw);
         if (parsed && typeof parsed === "object"){
           salesData = parsed.data || {};
-          homeBrand = parsed.brand || null;
+          mySales = parsed.mySales || {};
+          salesSources = parsed.sources || {};
         }
       }
-    } catch(e){ salesData = {}; }
+    } catch(e){ salesData = {}; mySales = {}; salesSources = {}; }
   }
   function saveSalesData(){
-    try { localStorage.setItem(salesKey(), JSON.stringify({ data:salesData, brand:homeBrand })); } catch(e){}
+    try { localStorage.setItem(salesKey(), JSON.stringify({ data:salesData, mySales:mySales, sources:salesSources })); } catch(e){}
   }
 
   function brandList(){
@@ -303,7 +310,8 @@
   }
   // Accepts "1.234,56", "1234,56", "1234.56", "1,234.56" and "€ 1 234,56".
   function parseFileAmount(str){
-    var s = String(str || "").replace(/[€\s ]/g, "");
+    if (typeof str === "number") return isFinite(str) ? str : null;
+    var s = String(str == null ? "" : str).replace(/[€\s ]/g, "");
     if (!s) return null;
     var lastComma = s.lastIndexOf(","), lastDot = s.lastIndexOf(".");
     if (lastComma > -1 && lastDot > -1){
@@ -319,7 +327,12 @@
   }
   // "2026-11", "2026/11", "11/2026", "11-2026", "2026-11-05", "05/11/2026" → "2026-11".
   function parseFileMonth(str){
-    var s = String(str || "").trim();
+    if (typeof str === "number" && str > 20000 && str < 80000){
+      // Excel date serial number (days since 1899-12-30).
+      var d = new Date(Date.UTC(1899, 11, 30) + str * 86400000);
+      return d.getUTCFullYear() + "-" + String(d.getUTCMonth()+1).padStart(2,"0");
+    }
+    var s = String(str == null ? "" : str).trim();
     var m;
     if ((m = s.match(/^(\d{4})[-\/.](\d{1,2})(?:[-\/.]\d{1,2})?$/))) return m[1] + "-" + m[2].padStart(2,"0");
     if ((m = s.match(/^(\d{1,2})[-\/.](\d{4})$/))) return m[2] + "-" + m[1].padStart(2,"0");
@@ -327,92 +340,331 @@
     return null;
   }
 
-  function parseSalesCsv(text){
+  function isTotalLabel(s){ return /^(sub)?total/.test(normalizeHeader(s)); }
+
+  // "Mes01", "Mês 1", "Jan", "janeiro" → 1..12; anything else → 0.
+  function headerMonthNumber(h){
+    var n = normalizeHeader(h);
+    var m = String(h == null ? "" : h).trim().toLowerCase().normalize("NFD").replace(/[̀-ͯ]/g, "").replace(/\s+/g, "").match(/^mes0?(\d{1,2})$/);
+    if (m){ var k = parseInt(m[1], 10); return (k >= 1 && k <= 12) ? k : 0; }
+    for (var i = 0; i < 12; i++){
+      var full = FULL_MONTHS[i].normalize("NFD").replace(/[̀-ͯ]/g, "");
+      if (n === full || n === MONTHS[i]) return i + 1;
+    }
+    return 0;
+  }
+
+  // Finds a header row with at least 3 month columns ("Mes01"…"Mes12", "Jan"…).
+  // Returns { headerIdx, monthCols:{ 1:colIndex, … } } or null.
+  function findMonthHeader(rows){
+    for (var h = 0; h < Math.min(rows.length, 20); h++){
+      var monthCols = {}, nMonths = 0;
+      for (var idx = 0; idx < rows[h].length; idx++){
+        var k = headerMonthNumber(rows[h][idx]);
+        if (k && monthCols[k] === undefined){ monthCols[k] = idx; nMonths++; }
+      }
+      if (nMonths >= 3) return { headerIdx:h, monthCols:monthCols };
+    }
+    return null;
+  }
+  function nonEmptyRows(table){
+    var rows = table.filter(function(r){
+      return r && r.some(function(c){ return c !== null && c !== undefined && String(c).trim() !== ""; });
+    });
+    if (rows.length < 2) throw new Error("O ficheiro não tem linhas de dados.");
+    return rows;
+  }
+  function cellText(v){ return String(v == null ? "" : v).trim(); }
+
+  // Purchases per brand, in one of two layouts:
+  //  - one column per month (ERP export): Descricao | Mes01 … Mes12 | Total — one row per brand,
+  //    values for the current year;
+  //  - one row per value: Mês | Marca | Compra.
+  // Returns { data:{ "AAAA-MM": { marca: n|null } }, rows, year? }.
+  function parsePurchaseRows(table){
+    var rows = nonEmptyRows(table);
+    var found = findMonthHeader(rows);
+    if (found){
+      var header = rows[found.headerIdx];
+      var cols = Object.keys(found.monthCols).map(function(k){ return found.monthCols[k]; });
+      var brandCol = -1;
+      for (var i = 0; i < header.length; i++){
+        if (["marca","brand","descricao","fornecedor","artigo"].indexOf(normalizeHeader(header[i])) > -1){ brandCol = i; break; }
+      }
+      if (brandCol < 0) brandCol = Math.min.apply(null, cols) > 0 ? 0 : -1;
+      if (brandCol < 0) throw new Error("Não encontrei a coluna das marcas.");
+      var year = todayStr().slice(0,4);
+      var data = {}, count = 0;
+      for (var r = found.headerIdx + 1; r < rows.length; r++){
+        var brand = cellText(rows[r][brandCol]);
+        if (!brand || isTotalLabel(brand)) continue;
+        for (var k = 1; k <= 12; k++){
+          if (found.monthCols[k] === undefined) continue;
+          var ym = year + "-" + String(k).padStart(2,"0");
+          data[ym] = data[ym] || {};
+          // An empty cell clears the value: the Excel file is the source of truth.
+          data[ym][brand] = parseFileAmount(rows[r][found.monthCols[k]]);
+        }
+        count++;
+      }
+      if (!count) throw new Error("Nenhuma marca encontrada no ficheiro.");
+      return { data:data, rows:count, year:year };
+    }
+
+    var headers = rows[0].map(normalizeHeader);
+    function col(names){
+      for (var j = 0; j < headers.length; j++) if (names.indexOf(headers[j]) > -1) return j;
+      return -1;
+    }
+    var iMonth = col(["mes","month","periodo","data","date"]);
+    var iBrand = col(["marca","brand","fornecedor","descricao"]);
+    var iBuy = col(["compra","compras","valorcompra","valordecompra","valor","purchase","purchases"]);
+    if (iBrand < 0) throw new Error("Não encontrei a coluna das marcas (\"Marca\" ou \"Descricao\").");
+    if (iBuy < 0) throw new Error("Não encontrei os valores (colunas \"Mes01…Mes12\" ou \"Compra\").");
+    var fallbackMonth = todayStr().slice(0,7);
+    var out = {}, n = 0;
+    for (var x = 1; x < rows.length; x++){
+      var b = cellText(rows[x][iBrand]);
+      var m = iMonth > -1 ? parseFileMonth(rows[x][iMonth]) : fallbackMonth;
+      var v = parseFileAmount(rows[x][iBuy]);
+      if (!b || isTotalLabel(b) || !m || v === null) continue;
+      out[m] = out[m] || {};
+      var key = findBrandKey(out[m], b) || b;
+      out[m][key] = (out[m][key] || 0) + v; // repeated brand/month rows are added together
+      n++;
+    }
+    if (!n) throw new Error("Nenhuma linha válida encontrada.");
+    return { data:out, rows:n };
+  }
+
+  // My own sales: one value per month.
+  //  - one column per month: uses the "Total" row if there is one, otherwise adds up all rows;
+  //  - one row per value: Mês | Venda (rows of the same month are added together).
+  // Returns { data:{ "AAAA-MM": n|null }, year? }.
+  function parseMySalesRows(table){
+    var rows = nonEmptyRows(table);
+    var found = findMonthHeader(rows);
+    if (found){
+      var year = todayStr().slice(0,4);
+      var body = rows.slice(found.headerIdx + 1);
+      var labelCol = Math.min.apply(null, Object.keys(found.monthCols).map(function(k){ return found.monthCols[k]; })) > 0 ? 0 : -1;
+      var totalRow = labelCol < 0 ? null : body.filter(function(r){ return isTotalLabel(cellText(r[labelCol])); })[0];
+      var useRows = totalRow ? [totalRow] : body;
+      var data = {};
+      for (var k = 1; k <= 12; k++){
+        if (found.monthCols[k] === undefined) continue;
+        var sum = null;
+        useRows.forEach(function(r){
+          var v = parseFileAmount(r[found.monthCols[k]]);
+          if (v !== null) sum = (sum || 0) + v;
+        });
+        data[year + "-" + String(k).padStart(2,"0")] = sum; // empty month → no value
+      }
+      return { data:data, year:year };
+    }
+
+    var headers = rows[0].map(normalizeHeader);
+    function col(names){
+      for (var j = 0; j < headers.length; j++) if (names.indexOf(headers[j]) > -1) return j;
+      return -1;
+    }
+    var iMonth = col(["mes","month","periodo","data","date"]);
+    var iSale = col(["venda","vendas","valorvenda","valordevenda","valor","total","sale","sales"]);
+    if (iMonth < 0 || iSale < 0) throw new Error("Não encontrei os valores (colunas \"Mes01…Mes12\", ou \"Mês\" e \"Venda\").");
+    var out = {}, n = 0;
+    for (var x = 1; x < rows.length; x++){
+      var m = parseFileMonth(rows[x][iMonth]);
+      var v = parseFileAmount(rows[x][iSale]);
+      if (!m || v === null) continue;
+      out[m] = (out[m] || 0) + v;
+      n++;
+    }
+    if (!n) throw new Error("Nenhuma linha válida encontrada.");
+    return { data:out };
+  }
+
+  function parseCsvText(text){
     var lines = String(text).replace(/^﻿/, "").split(/\r\n|\n|\r/).filter(function(l){ return l.trim() !== ""; });
-    if (lines.length < 2) throw new Error("O ficheiro não tem linhas de dados.");
+    if (!lines.length) return [];
     var first = lines[0];
     var sep = [";", "\t", ","].reduce(function(best, s){
       return first.split(s).length > first.split(best).length ? s : best;
     }, ";");
-    var headers = splitCsvLine(first, sep).map(normalizeHeader);
-    function col(names){
-      for (var i = 0; i < headers.length; i++) if (names.indexOf(headers[i]) > -1) return i;
-      return -1;
-    }
-    var iMonth = col(["mes","month","periodo","data","date"]);
-    var iBrand = col(["marca","brand","fornecedor"]);
-    var iSale = col(["venda","vendas","valorvenda","valordevenda","sale","sales"]);
-    var iBuy = col(["compra","compras","valorcompra","valordecompra","purchase","purchases"]);
-    if (iBrand < 0) throw new Error("Falta a coluna \"Marca\".");
-    if (iSale < 0 && iBuy < 0) throw new Error("Faltam as colunas \"Venda\" e/ou \"Compra\".");
-
-    var fallbackMonth = todayStr().slice(0,7);
-    var result = {}, rows = 0, skipped = 0;
-    for (var r = 1; r < lines.length; r++){
-      var cells = splitCsvLine(lines[r], sep);
-      var brand = (cells[iBrand] || "").trim();
-      var ym = iMonth > -1 ? parseFileMonth(cells[iMonth]) : fallbackMonth;
-      var sale = iSale > -1 ? parseFileAmount(cells[iSale]) : null;
-      var buy = iBuy > -1 ? parseFileAmount(cells[iBuy]) : null;
-      if (!brand || !ym || (sale === null && buy === null)){ skipped++; continue; }
-      result[ym] = result[ym] || {};
-      var key = findBrandKey(result[ym], brand) || brand;
-      var entry = result[ym][key] = result[ym][key] || { venda:null, compra:null };
-      // Several rows for the same brand and month are added together.
-      if (sale !== null) entry.venda = (entry.venda || 0) + sale;
-      if (buy !== null) entry.compra = (entry.compra || 0) + buy;
-      rows++;
-    }
-    if (!rows) throw new Error("Nenhuma linha válida encontrada.");
-    return { data:result, rows:rows, skipped:skipped };
+    return lines.map(function(l){ return splitCsvLine(l, sep); });
   }
 
-  function setHomeImportStatus(message, isError){
-    var s = document.getElementById("homeImportStatus");
+  var KIND_LABEL = { compra:"compras", venda:"vendas" };
+
+  function setHomeImportStatus(kind, message, isError){
+    var s = document.getElementById(kind === "venda" ? "homeSaleStatus" : "homePurchaseStatus");
     s.textContent = message || "";
     s.classList.toggle("error", !!isError);
   }
 
-  function importSalesFile(file){
-    var reader = new FileReader();
-    reader.onload = function(){
-      var parsed;
-      try { parsed = parseSalesCsv(reader.result); }
-      catch(e){ setHomeImportStatus("Não foi possível importar: " + e.message, true); return; }
-      var months = Object.keys(parsed.data).sort();
-      months.forEach(function(ym){
-        salesData[ym] = salesData[ym] || {};
-        Object.keys(parsed.data[ym]).forEach(function(brand){
-          var existing = findBrandKey(salesData[ym], brand);
-          if (existing && existing !== brand) delete salesData[ym][existing];
-          salesData[ym][brand] = parsed.data[ym][brand];
-        });
+  // Purchases go into salesData[ym][brand].compra; my sales into mySales[ym].
+  function applyParsed(kind, parsed, fileName){
+    Object.keys(parsed.data).forEach(function(ym){
+      if (kind === "venda"){
+        mySales[ym] = parsed.data[ym];
+        return;
+      }
+      salesData[ym] = salesData[ym] || {};
+      Object.keys(parsed.data[ym]).forEach(function(brand){
+        var existingKey = findBrandKey(salesData[ym], brand);
+        var entry = existingKey ? salesData[ym][existingKey] : {};
+        if (existingKey && existingKey !== brand) delete salesData[ym][existingKey];
+        entry.compra = parsed.data[ym][brand];
+        salesData[ym][brand] = entry;
       });
-      homeMonth = months.indexOf(todayStr().slice(0,7)) > -1 ? todayStr().slice(0,7) : months[months.length - 1];
-      saveSalesData();
-      setHomeImportStatus(
-        "Importadas " + parsed.rows + " linha(s) de " + months.length + " mês(es)" +
-        (parsed.skipped ? " · " + parsed.skipped + " linha(s) ignorada(s)" : "") + ".",
-        false
-      );
-      renderHome();
-    };
-    reader.onerror = function(){ setHomeImportStatus("Não foi possível ler o ficheiro.", true); };
-    reader.readAsText(file, "utf-8");
+    });
+    salesSources[kind] = { name:fileName, readAt:Date.now(), year:parsed.year || null };
+    saveSalesData();
   }
 
-  function downloadSalesTemplate(){
-    var ym = todayStr().slice(0,7);
-    var lines = ["Mês;Marca;Venda;Compra"].concat(DEFAULT_BRANDS.map(function(b){ return ym + ";" + b + ";0,00;0,00"; }));
-    var blob = new Blob(["﻿" + lines.join("\r\n") + "\r\n"], { type:"text/csv;charset=utf-8" });
-    var url = URL.createObjectURL(blob);
-    var a = document.createElement("a");
-    a.href = url;
-    a.download = "modelo-vendas-compras.csv";
-    document.body.appendChild(a);
-    a.click();
-    document.body.removeChild(a);
-    setTimeout(function(){ URL.revokeObjectURL(url); }, 1000);
+  function sourceStatusText(kind){
+    var src = salesSources[kind];
+    if (!src) return "";
+    var d = new Date(src.readAt);
+    var when = d.getDate() + " " + MONTHS[d.getMonth()] + " às " + String(d.getHours()).padStart(2,"0") + ":" + String(d.getMinutes()).padStart(2,"0");
+    return "Lido de " + src.name + " a " + when + (src.year ? " (meses de " + src.year + ")" : "") + ".";
+  }
+
+  function readSalesFile(file, kind){
+    if (/\.xls$/i.test(file.name)) return Promise.reject(new Error("formato .xls antigo; no Excel, guarda como .xlsx"));
+    var tableP;
+    if (/\.xlsx$/i.test(file.name)){
+      if (!window.QuadroXlsx) return Promise.reject(new Error("leitor de Excel indisponível"));
+      tableP = file.arrayBuffer().then(window.QuadroXlsx.read).then(function(res){ return res.rows; });
+    } else {
+      tableP = file.text().then(parseCsvText);
+    }
+    return tableP.then(function(rows){
+      var parsed = kind === "venda" ? parseMySalesRows(rows) : parsePurchaseRows(rows);
+      applyParsed(kind, parsed, file.name);
+      var thisMonth = todayStr().slice(0,7);
+      var months = Object.keys(parsed.data).sort();
+      homeMonth = months.indexOf(thisMonth) > -1 ? thisMonth : months[months.length - 1];
+      return parsed;
+    });
+  }
+
+  function importSalesFile(file, kind){
+    setHomeImportStatus(kind, "A ler " + file.name + "…", false);
+    return readSalesFile(file, kind).then(function(){
+      setHomeImportStatus(kind, sourceStatusText(kind), false);
+      renderHome();
+    }).catch(function(e){
+      setHomeImportStatus(kind, "Não foi possível ler o ficheiro: " + (e && e.message ? e.message : e) + ".", true);
+    });
+  }
+
+  // ---------- linked Excel files (stay on this computer; only read, never uploaded) ----------
+  // One file for purchases and one for sales. Chrome/Edge on a computer can keep a link
+  // to each file chosen once and re-read it later; other browsers import it each time.
+  var FILE_DB = "quadroTarefasFicheiros";
+  var linkedHandles = { compra:null, venda:null };
+  var pendingInputKind = "compra";
+  function canLinkFiles(){ return typeof window.showOpenFilePicker === "function"; }
+  function handleKey(kind){
+    // Purchases keep the key used before sales files existed.
+    return STORAGE_KEY + ":ficheiroVendasCompras" + (kind === "venda" ? ":vendas" : "");
+  }
+  function fileDb(){
+    return new Promise(function(resolve, reject){
+      var req = indexedDB.open(FILE_DB, 1);
+      req.onupgradeneeded = function(){ req.result.createObjectStore("handles"); };
+      req.onsuccess = function(){ resolve(req.result); };
+      req.onerror = function(){ reject(req.error); };
+    });
+  }
+  function storeHandle(kind, handle){
+    return fileDb().then(function(db){
+      return new Promise(function(resolve, reject){
+        var tx = db.transaction("handles", "readwrite");
+        tx.objectStore("handles").put(handle, handleKey(kind));
+        tx.oncomplete = function(){ resolve(); };
+        tx.onerror = function(){ reject(tx.error); };
+      });
+    });
+  }
+  function loadHandle(kind){
+    return fileDb().then(function(db){
+      return new Promise(function(resolve){
+        var req = db.transaction("handles").objectStore("handles").get(handleKey(kind));
+        req.onsuccess = function(){ resolve(req.result || null); };
+        req.onerror = function(){ resolve(null); };
+      });
+    }).catch(function(){ return null; });
+  }
+
+  function kindIds(kind){
+    return kind === "venda"
+      ? { refresh:"homeSaleRefreshBtn", link:"homeSaleLinkBtn" }
+      : { refresh:"homePurchaseRefreshBtn", link:"homePurchaseLinkBtn" };
+  }
+  function updateLinkButtons(kind){
+    var ids = kindIds(kind);
+    var h = linkedHandles[kind];
+    var refresh = document.getElementById(ids.refresh);
+    refresh.hidden = !h;
+    if (h) refresh.textContent = "Atualizar de " + h.name;
+    document.getElementById(ids.link).textContent = h ? "Escolher outro ficheiro" : "Escolher Excel de " + KIND_LABEL[kind];
+  }
+
+  // interactive=true only from a click: after a restart the browser asks again for permission to read.
+  function readLinkedFile(kind, interactive){
+    var h = linkedHandles[kind];
+    if (!h) return Promise.resolve();
+    var perm = h.queryPermission ? h.queryPermission({ mode:"read" }) : Promise.resolve("granted");
+    return perm.then(function(state){
+      if (state === "granted") return state;
+      if (interactive && h.requestPermission) return h.requestPermission({ mode:"read" });
+      return state;
+    }).then(function(state){
+      if (state !== "granted"){
+        setHomeImportStatus(kind, (salesSources[kind] ? sourceStatusText(kind) + " " : "") + "Carrega em \"Atualizar de " + h.name + "\" para ler os valores mais recentes.", false);
+        return;
+      }
+      return h.getFile().then(function(file){ return importSalesFile(file, kind); });
+    }).catch(function(e){
+      setHomeImportStatus(kind, "Não foi possível abrir " + h.name + " (" + (e && e.message ? e.message : e) + "). Escolhe o ficheiro outra vez.", true);
+    });
+  }
+
+  function chooseSalesFile(kind){
+    if (!canLinkFiles()){
+      pendingInputKind = kind;
+      document.getElementById("homeImportInput").click();
+      return;
+    }
+    window.showOpenFilePicker({
+      id:"ficheiro-" + kind,
+      multiple:false,
+      types:[{ description:"Excel ou CSV", accept:{
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet":[".xlsx"],
+        "text/csv":[".csv"]
+      } }]
+    }).then(function(handles){
+      linkedHandles[kind] = handles[0];
+      updateLinkButtons(kind);
+      storeHandle(kind, handles[0]).catch(function(){});
+      return readLinkedFile(kind, true);
+    }).catch(function(e){
+      if (e && e.name === "AbortError") return; // picker closed without choosing
+      setHomeImportStatus(kind, "Não foi possível escolher o ficheiro (" + (e && e.message ? e.message : e) + ").", true);
+    });
+  }
+
+  function initLinkedFiles(){
+    ["compra","venda"].forEach(function(kind){
+      if (salesSources[kind]) setHomeImportStatus(kind, sourceStatusText(kind), false);
+      if (!canLinkFiles()){ updateLinkButtons(kind); return; }
+      loadHandle(kind).then(function(h){
+        linkedHandles[kind] = h;
+        updateLinkButtons(kind);
+        if (h) readLinkedFile(kind, false);
+      });
+    });
   }
 
   function shiftHomeMonth(delta){
@@ -425,38 +677,58 @@
   function renderHome(){
     if (!homeMonth) homeMonth = todayStr().slice(0,7);
     var brands = brandList();
-    if (!homeBrand || brands.map(function(b){ return b.toLowerCase(); }).indexOf(homeBrand.toLowerCase()) < 0) homeBrand = brands[0];
-
-    var select = document.getElementById("homeBrandSelect");
-    select.innerHTML = "";
-    brands.forEach(function(b){
-      var opt = document.createElement("option");
-      opt.value = b;
-      opt.textContent = b;
-      if (b.toLowerCase() === homeBrand.toLowerCase()) opt.selected = true;
-      select.appendChild(opt);
-    });
 
     document.getElementById("homeMonthLabel").textContent = monthLabel(homeMonth);
     var monthData = salesData[homeMonth] || {};
-    var brandKeys = Object.keys(monthData);
 
-    var totalSale = 0, hasSale = false;
-    brandKeys.forEach(function(b){
-      if (monthData[b].venda != null){ totalSale += monthData[b].venda; hasSale = true; }
-    });
-    document.getElementById("homeSaleValue").textContent = hasSale ? formatCurrency(totalSale) : "—";
+    // My own sales value for the month (from the sales Excel).
+    var sale = mySales[homeMonth];
+    var hasSale = sale !== null && sale !== undefined;
+    document.getElementById("homeSaleValue").textContent = hasSale ? formatCurrency(sale) : "—";
     document.getElementById("homeSaleHint").textContent = hasSale
-      ? "Total de " + brandKeys.length + " marca(s) em " + monthLabel(homeMonth)
-      : "Sem valores importados para este mês";
+      ? "As minhas vendas em " + monthLabel(homeMonth)
+      : "Sem valor de venda para este mês";
 
-    var entry = monthData[findBrandKey(monthData, homeBrand)];
-    var hasBuy = entry && entry.compra != null;
-    document.getElementById("homePurchaseLabel").textContent = "Valor de compra · " + homeBrand;
-    document.getElementById("homePurchaseValue").textContent = hasBuy ? formatCurrency(entry.compra) : "—";
-    document.getElementById("homePurchaseHint").textContent = hasBuy
-      ? (entry.venda != null ? "Venda desta marca: " + formatCurrency(entry.venda) : "Sem valor de venda desta marca")
-      : "Sem valor de compra de " + homeBrand + " neste mês";
+    var rows = brands.map(function(b){
+      var entry = monthData[findBrandKey(monthData, b)];
+      return { brand:b, compra:(entry && entry.compra != null) ? entry.compra : null };
+    });
+    var totalBuy = 0, brandsWithBuy = 0, maxBuy = 0;
+    rows.forEach(function(r){
+      if (r.compra === null) return;
+      totalBuy += r.compra;
+      brandsWithBuy++;
+      if (r.compra > maxBuy) maxBuy = r.compra;
+    });
+    document.getElementById("homePurchaseValue").textContent = brandsWithBuy ? formatCurrency(totalBuy) : "—";
+    document.getElementById("homePurchaseHint").textContent = brandsWithBuy
+      ? "Soma de " + brandsWithBuy + " marca(s) em " + monthLabel(homeMonth)
+      : "Sem valores de compra para este mês";
+
+    // Brands with a value first (largest first), then the ones without a value.
+    rows.sort(function(a, b){
+      if (a.compra === null && b.compra === null) return 0;
+      if (a.compra === null) return 1;
+      if (b.compra === null) return -1;
+      return b.compra - a.compra;
+    });
+    var list = document.getElementById("homeBrandList");
+    list.innerHTML = "";
+    rows.forEach(function(r){
+      var li = el("li", "home-brand-row" + (r.compra === null ? " is-empty" : ""));
+      var name = el("span", "home-brand-name");
+      name.textContent = r.brand;
+      var bar = el("span", "home-brand-bar");
+      var fill = el("span", "home-brand-bar-fill");
+      fill.style.width = (r.compra !== null && maxBuy > 0 ? Math.max(2, Math.round(r.compra / maxBuy * 100)) : 0) + "%";
+      bar.appendChild(fill);
+      var value = el("span", "home-brand-value mono");
+      value.textContent = r.compra !== null ? formatCurrency(r.compra) : "—";
+      li.appendChild(name);
+      li.appendChild(bar);
+      li.appendChild(value);
+      list.appendChild(li);
+    });
   }
 
   function render(){
@@ -1408,17 +1680,15 @@
     });
     document.getElementById("homePrevMonthBtn").addEventListener("click", function(){ shiftHomeMonth(-1); });
     document.getElementById("homeNextMonthBtn").addEventListener("click", function(){ shiftHomeMonth(1); });
-    document.getElementById("homeBrandSelect").addEventListener("change", function(){
-      homeBrand = this.value;
-      saveSalesData();
-      renderHome();
+    ["compra","venda"].forEach(function(kind){
+      var ids = kindIds(kind);
+      document.getElementById(ids.link).addEventListener("click", function(){ chooseSalesFile(kind); });
+      document.getElementById(ids.refresh).addEventListener("click", function(){ readLinkedFile(kind, true); });
     });
-    document.getElementById("homeImportBtn").addEventListener("click", function(){ document.getElementById("homeImportInput").click(); });
     document.getElementById("homeImportInput").addEventListener("change", function(){
-      if (this.files && this.files[0]) importSalesFile(this.files[0]);
+      if (this.files && this.files[0]) importSalesFile(this.files[0], pendingInputKind);
       this.value = "";
     });
-    document.getElementById("homeTemplateBtn").addEventListener("click", downloadSalesTemplate);
     document.getElementById("addMeetingBottomBtn").addEventListener("click", function(){ openMeetingModal(null); });
     document.getElementById("addProjectBottomBtn").addEventListener("click", function(){ openProjectModal(null); });
     document.getElementById("addExpenseBottomBtn").addEventListener("click", function(){ openExpenseModal(null); });
@@ -1570,6 +1840,8 @@
     catch(e){ console.error("loadStore falhou", e); showFatalError("carregar dados", e); }
     try { loadSalesData(); }
     catch(e){ console.error("loadSalesData falhou", e); }
+    try { initLinkedFiles(); }
+    catch(e){ console.error("initLinkedFiles falhou", e); }
 
     try { wireStaticUI(); }
     catch(e){ console.error("wireStaticUI falhou", e); showFatalError("ligar botões", e); }
