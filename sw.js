@@ -1,6 +1,6 @@
 // Service worker: caches the app shell so the app works offline once loaded.
 // Bump CACHE_VERSION whenever an app-shell file changes.
-var CACHE_VERSION = "v17";
+var CACHE_VERSION = "v39";
 var CACHE_NAME = "quadro-tarefas-" + CACHE_VERSION;
 var APP_SHELL = [
   "./",
@@ -10,10 +10,13 @@ var APP_SHELL = [
   "./vendor/supabase.js",
   "./receipt.js",
   "./xlsx-reader.js",
+  "./excel-writer.js",
   "./app.js",
   "./sync.js",
   "./auth.js",
   "./icon.png",
+  "./icon-512.png",
+  "./brand/logo-simbolo.svg",
   "./manifest.webmanifest"
 ];
 
@@ -40,6 +43,8 @@ self.addEventListener("fetch", function(event){
   var req = event.request;
   // Only same-origin GETs; Supabase API/auth calls (other origin) always go straight to the network.
   if (req.method !== "GET" || new URL(req.url).origin !== self.location.origin) return;
+  // Excel files (Compras, Vendas, Despesas) are read straight from the folders and never copied into the cache.
+  if (/\/(Compras?|Vendas?|Despesas)\//i.test(new URL(req.url).pathname)) return;
   event.respondWith(
     // cache:"no-cache" revalidates with the server (cheap 304) so updates aren't hidden by the HTTP cache.
     fetch(req, { cache:"no-cache" }).then(function(res){
