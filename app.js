@@ -1101,7 +1101,7 @@
       return (projects[b].updatedAt||0) - (projects[a].updatedAt||0);
     });
     if (ids.length === 0){ wrap.appendChild(el("div", "empty-hint", "Sem projetos registados ainda.")); return; }
-    ids.forEach(function(id){ wrap.appendChild(renderProjectRow(id)); });
+    ids.forEach(function(id){ wrap.appendChild(renderProjectBlock(id)); });
   }
 
   function renderProjectRow(id){
@@ -1339,6 +1339,130 @@
     return { done:done, total:list.length, next:next, state: next ? stepState(next) : null };
   }
 
+  // ---------- project timeline (vertical) ----------
+  // Everything with a date that belongs to a project, in order: cronograma stages, the project's
+  // tasks (with their work points) and meetings (with their actions), plus a "Hoje" marker.
+  var collapsedTimelines = {};
+  try { collapsedTimelines = JSON.parse(localStorage.getItem("qt_project_timeline_closed") || "{}") || {}; } catch(e){}
+  var TL_KIND_LABEL = { etapa:"Etapa", tarefa:"Tarefa", reuniao:"Reunião" };
+  var TASK_STATUS_TEXT = { todo:"A fazer", doing:"Em curso", done:"Concluída" };
+
+  function projectTimelineItems(pid){
+    var p = projects[pid], today = todayStr(), items = [];
+    (p.schedule || []).forEach(function(s){
+      items.push({
+        kind:"etapa", date:s.due, title:s.name, state:stepState(s),
+        detail:(s.start && s.start !== s.due ? "Início " + shortDate(s.start) + " → " : "") + "Entrega " + shortDate(s.due),
+        points:[], open:function(){ openProjectModal(pid); }
+      });
+    });
+    Object.keys(tasks).forEach(function(id){
+      var t = tasks[id];
+      if (t.projectId !== pid) return;
+      var state;
+      if (t.status === "done") state = { cls:"done", text:"Concluída" };
+      else if (t.due && t.due < today) state = { cls:"late", text:"Atrasada" };
+      else if (t.due && daysBetween(today, t.due) <= 7) state = { cls:"soon", text:TASK_STATUS_TEXT[t.status] };
+      else state = { cls:"planned", text:TASK_STATUS_TEXT[t.status] || "A fazer" };
+      items.push({
+        kind:"tarefa", date:t.due || null, title:t.title, state:state,
+        detail:(PRIORITY_LABEL[t.priority] ? "Prioridade " + PRIORITY_LABEL[t.priority].toLowerCase() : "") + (t.due ? "" : " · sem prazo"),
+        points:(t.points || []).map(function(x){ return { text:x.text, done:!!x.done }; }),
+        open:function(){ openTaskModal(id); }
+      });
+    });
+    Object.keys(meetings).forEach(function(id){
+      var m = meetings[id];
+      if (m.projectId !== pid) return;
+      var actions = m.actions || [];
+      var pending = actions.filter(function(a){ return !a.done; }).length;
+      var state = m.date && m.date > today ? { cls:"planned", text:"Agendada" }
+        : (pending ? { cls:"soon", text:pending + (pending === 1 ? " ação pendente" : " ações pendentes") } : { cls:"done", text:"Realizada" });
+      items.push({
+        kind:"reuniao", date:m.date || null, title:m.title, state:state,
+        detail:m.summary ? m.summary.split(/\r?\n/)[0] : "",
+        points:actions.map(function(a){ return { text:a.text, done:!!a.done }; }),
+        open:function(){ openMeetingModal(id); }
+      });
+    });
+    items.sort(function(a, b){
+      if (!a.date && !b.date) return 0;
+      if (!a.date) return 1;
+      if (!b.date) return -1;
+      return a.date < b.date ? -1 : (a.date > b.date ? 1 : 0);
+    });
+    return items;
+  }
+
+  function renderProjectTimeline(pid, items){
+    var today = todayStr();
+    var list = el("ol", "ptl");
+    var todayShown = false;
+    function todayMarker(){
+      var li = el("li", "ptl-today");
+      li.appendChild(el("span", "ptl-today-label", "Hoje · " + shortDate(today)));
+      list.appendChild(li);
+      todayShown = true;
+    }
+    items.forEach(function(it){
+      if (!todayShown && (!it.date || it.date > today)) todayMarker();
+      var li = el("li", "ptl-item ptl-" + it.kind + (it.date && it.date < today ? " is-past" : ""));
+      var date = el("div", "ptl-date");
+      date.textContent = it.date ? shortDate(it.date) : "Sem data";
+      li.appendChild(date);
+      li.appendChild(el("span", "ptl-dot"));
+
+      var card = el("button", "ptl-card");
+      card.type = "button";
+      card.addEventListener("click", function(e){ e.stopPropagation(); it.open(); });
+      var head = el("div", "ptl-head");
+      head.appendChild(el("span", "ptl-kind", TL_KIND_LABEL[it.kind]));
+      var title = el("span", "ptl-title"); title.textContent = it.title; head.appendChild(title);
+      head.appendChild(el("span", "ptl-state state-" + it.state.cls, escapeHtml(it.state.text)));
+      card.appendChild(head);
+      if (it.detail){ var det = el("div", "ptl-detail"); det.textContent = it.detail; card.appendChild(det); }
+      if (it.points.length){
+        var ul = el("ul", "ptl-points");
+        it.points.forEach(function(pt){
+          var pli = el("li", pt.done ? "is-done" : "");
+          pli.appendChild(el("span", "ptl-check", pt.done ? "✓" : ""));
+          var tx = el("span"); tx.textContent = pt.text; pli.appendChild(tx);
+          ul.appendChild(pli);
+        });
+        card.appendChild(ul);
+      }
+      li.appendChild(card);
+      list.appendChild(li);
+    });
+    if (!todayShown) todayMarker();
+    return list;
+  }
+
+  function renderProjectBlock(pid){
+    var block = el("div", "project-block");
+    var row = renderProjectRow(pid);
+    var items = projectTimelineItems(pid);
+    if (items.length){
+      var closed = !!collapsedTimelines[pid];
+      var toggle = el("button", "project-timeline-toggle" + (closed ? "" : " is-open"));
+      toggle.type = "button";
+      toggle.setAttribute("aria-expanded", closed ? "false" : "true");
+      toggle.textContent = (closed ? "▸ " : "▾ ") + "Linha temporal (" + items.length + ")";
+      toggle.addEventListener("click", function(e){
+        e.stopPropagation();
+        if (collapsedTimelines[pid]) delete collapsedTimelines[pid]; else collapsedTimelines[pid] = true;
+        try { localStorage.setItem("qt_project_timeline_closed", JSON.stringify(collapsedTimelines)); } catch(err){}
+        renderProjectsList();
+      });
+      row.querySelector(".project-row-main").appendChild(toggle);
+      block.appendChild(row);
+      if (!closed) block.appendChild(renderProjectTimeline(pid, items));
+    } else {
+      block.appendChild(row);
+    }
+    return block;
+  }
+
   // ---------- expenses monthly map ----------
   function ensureCurrentMonth(){ if (!currentMonth) currentMonth = todayStr().slice(0,7); }
   function monthLabel(ym){
@@ -1557,6 +1681,7 @@
     var payload = {
       title:title,
       clientId: document.getElementById("meetingClient").value || null,
+      projectId: document.getElementById("meetingProject").value || null,
       date: document.getElementById("meetingDate").value || todayStr(),
       agenda: document.getElementById("meetingAgenda").value.trim(),
       notes: document.getElementById("meetingNotes").value.trim(),
@@ -2160,9 +2285,10 @@
     sel.appendChild(newOpt);
   }
   // Existing projects: the chosen client's first, then the others; finished ones marked.
-  function populateTaskProjectSelect(selectedId){
-    var sel = document.getElementById("taskProject");
-    var clientId = document.getElementById("taskClient").value;
+  function populateTaskProjectSelect(selectedId){ populateProjectSelect("taskProject", "taskClient", selectedId); }
+  function populateProjectSelect(selectId, clientSelectId, selectedId){
+    var sel = document.getElementById(selectId);
+    var clientId = document.getElementById(clientSelectId).value;
     sel.innerHTML = "";
     var none = el("option", "", "Sem projeto");
     none.value = "";
@@ -2284,6 +2410,7 @@
       document.getElementById("meetingTitle").value = m.title;
       document.getElementById("meetingDate").value = m.date || todayStr();
       populateClientSelect("meetingClient", m.clientId);
+      populateProjectSelect("meetingProject", "meetingClient", m.projectId);
       document.getElementById("meetingAgenda").value = m.agenda || "";
       document.getElementById("meetingNotes").value = m.notes || "";
       document.getElementById("meetingSummary").value = m.summary || "";
@@ -2295,6 +2422,7 @@
       document.getElementById("meetingTitle").value = "";
       document.getElementById("meetingDate").value = todayStr();
       populateClientSelect("meetingClient", activeClientFilter);
+      populateProjectSelect("meetingProject", "meetingClient", null);
       document.getElementById("meetingAgenda").value = "";
       document.getElementById("meetingNotes").value = "";
       document.getElementById("meetingSummary").value = "";
@@ -3015,6 +3143,16 @@
 
     document.getElementById("taskClient").addEventListener("change", onTaskClientChange);
     document.getElementById("taskProject").addEventListener("change", onTaskProjectChange);
+    document.getElementById("meetingClient").addEventListener("change", function(){
+      populateProjectSelect("meetingProject", "meetingClient", document.getElementById("meetingProject").value);
+    });
+    document.getElementById("meetingProject").addEventListener("change", function(){
+      var pr = projects[this.value], clientSel = document.getElementById("meetingClient");
+      if (pr && pr.clientId && clients[pr.clientId] && !clientSel.value){
+        clientSel.value = pr.clientId;
+        populateProjectSelect("meetingProject", "meetingClient", this.value);
+      }
+    });
     document.getElementById("taskNewClientAddBtn").addEventListener("click", createClientFromTaskModal);
     document.getElementById("taskNewClientName").addEventListener("keydown", function(e){
       if (e.key === "Enter"){ e.preventDefault(); createClientFromTaskModal(); }

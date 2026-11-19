@@ -819,3 +819,48 @@ table.expenses-table{ width:100%; min-width:600px; border-collapse:collapse; fon
 }
 .field .schedule-weeks input[type="number"]:focus{ outline:none; border-color:var(--accent); box-shadow:0 0 0 3px var(--accent-ring); }
 .schedule-duration{ font-size:11.5px; color:var(--text-faint); margin-left:2px; }
+
+/* ---------- project vertical timeline ---------- */
+.project-block + .project-block{ border-top:1px solid var(--border); }
+.project-block > .project-row{ border-top:none; }
+.project-timeline-toggle{
+  align-self:flex-start; margin-top:6px; padding:3px 9px; border-radius:6px; cursor:pointer;
+  font-family:inherit; font-size:12px; font-weight:600; color:var(--accent); background:var(--accent-soft); border:none;
+}
+.project-timeline-toggle:hover{ filter:brightness(.97); }
+.ptl{ list-style:none; margin:0; padding:4px 16px 18px; position:relative; }
+/* the vertical line runs behind the dots */
+.ptl::before{ content:""; position:absolute; top:6px; bottom:18px; left:calc(16px + 74px + 7px); width:2px; background:var(--border); border-radius:2px; }
+.ptl-item{ position:relative; display:grid; grid-template-columns:74px 16px minmax(0,1fr); column-gap:12px; align-items:start; padding:6px 0; }
+.ptl-date{ text-align:right; font-size:12px; font-weight:600; color:var(--text-muted); padding-top:10px; font-variant-numeric:tabular-nums; white-space:nowrap; }
+.ptl-dot{ position:relative; z-index:1; width:16px; height:16px; margin-top:10px; border-radius:50%; background:var(--surface); border:3px solid var(--accent); box-sizing:border-box; }
+.ptl-tarefa .ptl-dot{ border-color:var(--info); }
+.ptl-reuniao .ptl-dot{ border-color:var(--warn); }
+.ptl-item.is-past .ptl-date{ color:var(--text-faint); }
+.ptl-card{
+  display:flex; flex-direction:column; gap:3px; width:100%; text-align:left; cursor:pointer;
+  padding:9px 12px; border-radius:10px; border:1px solid var(--border); background:var(--surface);
+  font-family:inherit; color:var(--text); transition:border-color .15s ease, box-shadow .15s ease;
+}
+.ptl-card:hover{ border-color:var(--border-strong); box-shadow:var(--shadow); }
+.ptl-head{ display:flex; align-items:center; gap:8px; min-width:0; flex-wrap:wrap; }
+.ptl-kind{ flex:none; font-size:10.5px; font-weight:700; text-transform:uppercase; letter-spacing:.05em; color:var(--accent); }
+.ptl-tarefa .ptl-kind{ color:var(--info); }
+.ptl-reuniao .ptl-kind{ color:var(--warn); }
+.ptl-title{ flex:1 1 160px; min-width:0; font-size:14px; font-weight:600; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.ptl-state{ flex:none; font-size:11px; font-weight:600; padding:1px 8px; border-radius:999px; }
+.ptl-detail{ font-size:12.5px; color:var(--text-muted); overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.ptl-points{ list-style:none; margin:4px 0 0; padding:0; display:flex; flex-direction:column; gap:3px; }
+.ptl-points li{ display:flex; align-items:center; gap:7px; font-size:12.5px; color:var(--text); }
+.ptl-points li.is-done{ color:var(--text-faint); text-decoration:line-through; }
+.ptl-check{ flex:none; width:14px; height:14px; border-radius:4px; border:1.5px solid var(--border-strong); font-size:10px; line-height:11px; text-align:center; color:#fff; }
+.ptl-points li.is-done .ptl-check{ background:var(--success); border-color:var(--success); }
+.ptl-today{ position:relative; display:grid; grid-template-columns:74px 16px minmax(0,1fr); column-gap:12px; align-items:center; padding:4px 0; }
+.ptl-today::after{ content:""; grid-column:2 / 4; height:0; border-top:2px dashed var(--danger); }
+.ptl-today-label{ grid-column:1; text-align:right; font-size:11px; font-weight:700; color:var(--danger); white-space:nowrap; }
+@media (max-width:480px){
+  .ptl{ padding:2px 10px 14px; }
+  .ptl::before{ left:calc(10px + 54px + 7px); }
+  .ptl-item, .ptl-today{ grid-template-columns:54px 16px minmax(0,1fr); column-gap:8px; }
+  .ptl-date{ font-size:11px; white-space:normal; }
+}
